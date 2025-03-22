@@ -135,20 +135,21 @@ async def create_recharge_order(request: WalletRechargeRequest):
                 detail=f"Failed to create payment order: {str(e)}"
             )
 
-        # Store order details in database with proper description and formatted date
+        # Create order document with date
         current_time = datetime.datetime.now()
         formatted_date = current_time.strftime("%d/%m/%Y, %H:%M:%S")
         
         order_doc = {
             "order_id": order['id'],
-            "amount": float(request.amount),
             "student_id": request.student_id,
             "vendor_id": request.vendor_id,
+            "amount": request.amount,
             "status": "pending",
-            "description": f"Wallet recharge via {vendor['name']}",
+            "type": "recharge",
             "created_at": current_time,
             "formatted_date": formatted_date
         }
+        
         transactions_collection.insert_one(order_doc)
 
         # Get parent and vendor details for SMS
@@ -316,72 +317,100 @@ async def get_student_qr(student_id: str):
         "balance": student["balance"]
     }
 
-# Process Student Payment
+# Update the StudentPaymentRequest model to include password
+class StudentPaymentRequest(BaseModel):
+    student_id: str
+    vendor_id: str
+    amount: float
+    description: str = ""
+    password: str  # Added password field
+
 @app.post("/process_student_payment")
 async def process_student_payment(payment: StudentPaymentRequest):
-    # Verify student exists and has sufficient balance
-    student = students_collection.find_one({"student_id": payment.student_id})
-    if not student:
-        raise HTTPException(status_code=404, detail="Student not found")
-    
-    if student["balance"] < payment.amount:
-        raise HTTPException(status_code=400, detail="Insufficient balance")
+    try:
+        print("Processing payment request:", payment.dict())
+        
+        # Verify student exists and check password
+        student = students_collection.find_one({"student_id": payment.student_id})
+        if not student:
+            raise HTTPException(status_code=404, detail="Student not found")
+        
+        # Verify student password
+        if payment.password != student.get("password"):
+            raise HTTPException(status_code=401, detail="Invalid student password")
+        
+        # Check balance
+        if student["balance"] < payment.amount:
+            raise HTTPException(status_code=400, detail="Insufficient balance")
 
-    # Verify vendor exists
-    vendor = vendors_collection.find_one({"vendor_id": payment.vendor_id})
-    if not vendor:
-        raise HTTPException(status_code=404, detail="Vendor not found")
+        # Verify vendor exists and has sufficient balance
+        vendor = vendors_collection.find_one({"vendor_id": payment.vendor_id})
+        if not vendor:
+            raise HTTPException(status_code=404, detail="Vendor not found")
+            
+        if vendor.get("balance", 0) < payment.amount:
+            raise HTTPException(status_code=400, detail="Insufficient vendor balance")
 
-    # Get current vendor balance or default to 0 if not exists
-    current_vendor_balance = vendor.get("balance", 0)
-
-    # Process the transaction
-    new_student_balance = student["balance"] - payment.amount
-    new_vendor_balance = current_vendor_balance + payment.amount
-    
-    # Update student balance
-    students_collection.update_one(
-        {"student_id": payment.student_id},
-        {"$set": {"balance": new_student_balance}}
-    )
-
-    # Update vendor balance
-    vendors_collection.update_one(
-        {"vendor_id": payment.vendor_id},
-        {"$set": {"balance": new_vendor_balance}}
-    )
-
-    # Record the transaction
-    transaction = {
-        "student_id": payment.student_id,
-        "vendor_id": payment.vendor_id,
-        "amount": payment.amount,
-        "type": "purchase",
-        "description": payment.description,
-        "status": "completed",
-        "timestamp": datetime.datetime.now(),
-        "student_balance": new_student_balance,
-        "vendor_balance": new_vendor_balance
-    }
-    transactions_collection.insert_one(transaction)
-
-    # Get parent and vendor details for SMS
-    parent = await get_parent_by_student_id(payment.student_id)
-
-    if parent and parent.phone:
-        message = format_purchase_message(
-            amount=payment.amount,
-            vendor_name=vendor["name"],
-            student_name=student["name"]
+        # Process the transaction
+        new_student_balance = student["balance"] - payment.amount
+        new_vendor_balance = vendor.get("balance", 0) - payment.amount
+        current_time = datetime.datetime.now()
+        formatted_date = current_time.strftime("%d/%m/%Y, %H:%M:%S")
+        
+        # Update student balance
+        students_collection.update_one(
+            {"student_id": payment.student_id},
+            {"$set": {"balance": new_student_balance}}
         )
-        send_payment_notification(parent.phone, message)
 
-    return {
-        "message": "Payment processed successfully",
-        "student_balance": new_student_balance,
-        "vendor_balance": new_vendor_balance,
-        "transaction_id": str(transaction["_id"])
-    }
+        # Update vendor balance
+        vendors_collection.update_one(
+            {"vendor_id": payment.vendor_id},
+            {"$set": {"balance": new_vendor_balance}}
+        )
+
+        # Record the transaction
+        transaction = {
+            "student_id": payment.student_id,
+            "vendor_id": payment.vendor_id,
+            "amount": payment.amount,
+            "type": "purchase",
+            "description": payment.description,
+            "status": "completed",
+            "timestamp": current_time,
+            "formatted_date": formatted_date,
+            "student_balance": new_student_balance,
+            "vendor_balance": new_vendor_balance
+        }
+        transactions_collection.insert_one(transaction)
+
+        # Send notification to parent
+        try:
+            parent = await get_parent_by_student_id(payment.student_id)
+            if parent and parent.phone:
+                message = format_purchase_message(
+                    amount=payment.amount,
+                    vendor_name=vendor["name"],
+                    student_name=student["name"]
+                )
+                send_payment_notification(parent.phone, message)
+        except Exception as e:
+            print(f"Error sending notification: {str(e)}")
+
+        return {
+            "status": "success",
+            "message": "Payment processed successfully",
+            "student_balance": new_student_balance,
+            "vendor_balance": new_vendor_balance,
+            "transaction_date": formatted_date,
+            "transaction_id": str(transaction["_id"])
+        }
+
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Payment processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Get Student Transactions
 @app.get("/student/transactions/{student_id}")

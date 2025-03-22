@@ -20,6 +20,7 @@ def seed_data():
             "parent_id": "PAR001",
             "parent_phone": "+918600194737",
             "parent_name": "Mr. Doe",
+            "password": "1234",
             "class": "10th",
             "section": "A"
         },
@@ -30,6 +31,7 @@ def seed_data():
             "parent_id": "PAR002",
             "parent_phone": "+918600194737",
             "parent_name": "Mr. Smith",
+            "password": "5678",
             "class": "9th",
             "section": "B"
         }
